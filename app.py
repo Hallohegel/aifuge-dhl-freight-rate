@@ -103,23 +103,98 @@ else:
 # 货物输入
 # =========================
 
+# =========================
+# 货物输入（左侧输入，右侧自动计算 + SUM 汇总）
+# =========================
+
 st.subheader("货物明细")
 
-data = st.data_editor(
-    pd.DataFrame([{"数量":1,"长(cm)":60,"宽(cm)":40,"高(cm)":40,"实重(kg)":20}]),
-    num_rows="dynamic"
+# 初始化可编辑输入表（只存左侧输入列）
+if "cargo_input" not in st.session_state:
+    st.session_state.cargo_input = pd.DataFrame(
+        [{"数量": 1, "长(cm)": 60, "宽(cm)": 40, "高(cm)": 40, "实重(kg)": 20}]
+    )
+
+input_cols = ["数量", "长(cm)", "宽(cm)", "高(cm)", "实重(kg)"]
+
+def compute_cargo(df: pd.DataFrame, factor: float) -> pd.DataFrame:
+    df = df.copy()
+
+    # 防御：全部转数字，空值=0
+    for c in input_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+    # 单件体积 (m³/件)
+    df["体积(m³/件)"] = (df["长(cm)"]/100) * (df["宽(cm)"]/100) * (df["高(cm)"]/100)
+
+    # 单件体积重 (kg/件) = 单件体积 * factor(kg/m³)
+    df["体积重(kg/件)"] = df["体积(m³/件)"] * float(factor)
+
+    # 单件计费重 (kg/件) = max(单件实重, 单件体积重)
+    df["计费重(kg/件)"] = df[["实重(kg)", "体积重(kg/件)"]].max(axis=1)
+
+    # 汇总列（每行合计）
+    df["实重(kg)"] = df["实重(kg)"].round(2)
+    df["体积(m³)"] = (df["体积(m³/件)"] * df["数量"]).round(3)
+    df["体积重(kg)"] = (df["体积重(kg/件)"] * df["数量"]).round(2)
+    df["计费重(kg)"] = (df["计费重(kg/件)"] * df["数量"]).round(2)
+
+    # 展示更美观
+    df["体积(m³/件)"] = df["体积(m³/件)"].round(3)
+    df["体积重(kg/件)"] = df["体积重(kg/件)"].round(2)
+    df["计费重(kg/件)"] = df["计费重(kg/件)"].round(2)
+
+    return df
+
+# 先算出显示用表（包含右侧自动列）
+cargo_calc = compute_cargo(st.session_state.cargo_input, factor)
+
+# 右侧自动列（只读）
+readonly_cols = ["体积(m³)", "体积重(kg)", "计费重(kg)"]
+
+# 你要的“左输入 + 右自动算”的同一张表
+edited = st.data_editor(
+    cargo_calc[[
+        "数量", "长(cm)", "宽(cm)", "高(cm)", "实重(kg)",
+        "体积(m³)", "体积重(kg)", "计费重(kg)"
+    ]],
+    num_rows="dynamic",
+    use_container_width=True,
+    hide_index=True,
+    disabled=readonly_cols,   # ✅ 右侧三列锁定只读
+    column_config={
+        "数量": st.column_config.NumberColumn(min_value=0, step=1),
+        "长(cm)": st.column_config.NumberColumn(min_value=0),
+        "宽(cm)": st.column_config.NumberColumn(min_value=0),
+        "高(cm)": st.column_config.NumberColumn(min_value=0),
+        "实重(kg)": st.column_config.NumberColumn(min_value=0),
+        "体积(m³)": st.column_config.NumberColumn(format="%.3f"),
+        "体积重(kg)": st.column_config.NumberColumn(format="%.2f"),
+        "计费重(kg)": st.column_config.NumberColumn(format="%.2f"),
+    },
 )
 
-data["泡重(kg/件)"] = data.apply(lambda r: volumetric_weight(r["长(cm)"],r["宽(cm)"],r["高(cm)"],factor),axis=1)
-data["计费重(kg/件)"] = data[["实重(kg)","泡重(kg/件)"]].max(axis=1)
-data["计费重(kg)"] = data["计费重(kg/件)"]*data["数量"]
-data["体积(m³)"] = (data["长(cm)"]/100)*(data["宽(cm)"]/100)*(data["高(cm)"]/100)*data["数量"]
+# 保存左侧输入列到 session_state，再重新计算
+st.session_state.cargo_input = edited[input_cols].copy()
+data = compute_cargo(st.session_state.cargo_input, factor)
 
-total_charge_raw = data["计费重(kg)"].sum()
-total_volume = data["体积(m³)"].sum()
+# SUM 汇总（你要的四个）
+total_real = float((data["实重(kg)"] * data["数量"]).sum())
+total_volume = float(data["体积(m³)"].sum())
+total_vol_weight = float(data["体积重(kg)"].sum())
+total_charge_raw = float(data["计费重(kg)"].sum())
 
-MIN_BILLABLE = st.number_input("最低计费重量(kg)",value=0.0)
-total_charge = max(total_charge_raw,MIN_BILLABLE)
+st.markdown("### SUM 汇总")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("总实重 (kg)", f"{total_real:.2f}")
+c2.metric("总体积 (m³)", f"{total_volume:.3f}")
+c3.metric("总体积重 (kg)", f"{total_vol_weight:.2f}")
+c4.metric("总计费重 (kg)", f"{total_charge_raw:.2f}")
+
+# 你原来的最低计费重逻辑继续保留
+MIN_BILLABLE = st.number_input("最低计费重量(kg)", value=0.0)
+total_charge = max(total_charge_raw, MIN_BILLABLE)
+
 
 # =========================
 # 运费匹配
