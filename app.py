@@ -1,649 +1,656 @@
+# app.py
+# Aifuge Freight Engine V6 — 5家成本 + 对客报价(SELL) + 毛利
+# Auto-load from ./data/ (无需每次手动上传)
+
 import os
 import re
 from dataclasses import dataclass
-from io import BytesIO
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ==========================================================
-# Aifuge Freight Engine V8
-# - 5 carriers cost + sell price + margin
-# - auto-load from data/
-# - key format: PREFIX-CC--ZZ (double dash)
-# - robust key matching (tries multiple zone candidates)
-# ==========================================================
 
-APP_VERSION = "V8"
+# =========================
+# 0) Paths (data/)
+# =========================
 DATA_DIR = "data"
 
 PATHS = {
-    "DHL": f"{DATA_DIR}/DHL_Frachtkosten.xlsx",
-    "RABEN": f"{DATA_DIR}/Raben_Frachtkosten.xlsx",
-    "RABEN_RULES": f"{DATA_DIR}/Raben 立方米及装载米规则.xlsx",
-    "SCHENKER": f"{DATA_DIR}/Schenker_Frachtkosten.xlsx",
-    "SCHENKER_MAUT": f"{DATA_DIR}/Schenker_Maut.xlsx",
-    "HELLMANN": f"{DATA_DIR}/Hellmann_Frachtkosten_2026.xlsx",
-    "FEDEX": f"{DATA_DIR}/FedEx_Frachtkosten.xlsx",
-    "SELL": f"{DATA_DIR}/超大件账号价格-2026.01.01.xlsx",
+    "DHL": os.path.join(DATA_DIR, "DHL_Frachtkosten.xlsx"),
+    "RABEN": os.path.join(DATA_DIR, "Raben_Frachtkosten.xlsx"),
+    "RABEN_RULES": os.path.join(DATA_DIR, "Raben 立方米及装载米规则.xlsx"),
+    "SCHENKER": os.path.join(DATA_DIR, "Schenker_Frachtkosten.xlsx"),
+    "SCHENKER_MAUT": os.path.join(DATA_DIR, "Schenker_Maut.xlsx"),
+    "HELLMANN": os.path.join(DATA_DIR, "Hellmann_Frachtkosten_2026.xlsx"),
+    "FEDEX": os.path.join(DATA_DIR, "FedEx_Frachtkosten.xlsx"),
+    "SELL": os.path.join(DATA_DIR, "SELL_Frachtkosten.xlsx"),
 }
 
-st.set_page_config(layout="wide")
-st.title(f"Aifuge Freight Engine {APP_VERSION} — 成本 + 对客报价 + 毛利")
+SUPPLIERS = ["DHL", "Raben", "Schenker", "Hellmann", "FedEx"]
 
-# -----------------------------
-# Common helpers
-# -----------------------------
 
-def cc(x: str) -> str:
-    return str(x).strip().upper()
+# =========================
+# 1) Helpers
+# =========================
+def norm_col(c: str) -> str:
+    return re.sub(r"\s+", "", str(c)).strip().lower()
 
-def digits(s: str) -> str:
-    return re.sub(r"\D+", "", str(s or ""))
 
-def zip_prefix_candidates(postal: str) -> List[str]:
+def find_key_col(df: pd.DataFrame) -> Optional[str]:
+    for c in df.columns:
+        if norm_col(c) == "key":
+            return c
+    # fallback: first col if looks like keys
+    if df.shape[1] > 0:
+        c0 = df.columns[0]
+        if df[c0].astype(str).str.contains(r"^[A-Z]+-[A-Z]{2}-", regex=True, na=False).mean() > 0.3:
+            return c0
+    return None
+
+
+def bis_cols(df: pd.DataFrame) -> List[Tuple[str, float]]:
     """
-    Return multiple candidates to match keys robustly.
-    Example DE 38112 -> ["38112","3811","381","38"]
+    Return list of (col_name, limit_kg) for cols like bis-30, bis-2500
     """
-    d = digits(postal)
-    if not d:
-        return []
-    cands = []
-    for k in [5,4,3,2]:
-        if len(d) >= k:
-            cands.append(d[:k])
-    # Deduplicate preserve order
     out = []
-    for x in cands:
-        if x not in out:
-            out.append(x)
+    for c in df.columns:
+        s = str(c).strip()
+        m = re.match(r"^bis[-_ ]?(\d+(\.\d+)?)$", s, flags=re.IGNORECASE)
+        if m:
+            out.append((c, float(m.group(1))))
+    out.sort(key=lambda x: x[1])
     return out
 
-def make_key(prefix: str, country: str, zone: str) -> str:
-    return f"{prefix}-{cc(country)}--{zone}"
 
-def weight_cols(df: pd.DataFrame) -> List[str]:
-    cols = [c for c in df.columns if str(c).strip().lower().startswith("bis-")]
-    def w(c):
-        m = re.search(r"bis-(\d+)", str(c))
-        return int(m.group(1)) if m else 10**9
-    return sorted(cols, key=w)
+def pick_bracket(bis_list: List[Tuple[str, float]], charge_kg: float) -> Optional[str]:
+    for col, limit in bis_list:
+        if charge_kg <= limit + 1e-9:
+            return col
+    return None
 
-def pick_bracket(cols: List[str], w_kg: float) -> str:
-    # choose the first bis-X that >= w_kg
-    for c in cols:
-        m = re.search(r"bis-(\d+)", str(c))
-        if m and w_kg <= float(m.group(1)):
-            return c
-    return cols[-1] if cols else ""
 
-def safe_float(x, default=0.0) -> float:
+def parse_zone_from_input(zone_input: str) -> str:
+    """
+    支持:
+    - 数字邮编前2位：'38112'->'38', '08xxx'->'08'
+    - 爱尔兰/特殊：'DUB'/'COR' 等 -> 'DUB'
+    """
+    s = (zone_input or "").strip().upper()
+    # take first 2 digits if any digits exist
+    digits = re.findall(r"\d", s)
+    if digits:
+        dd = "".join(digits)
+        return dd[:2].zfill(2)
+    # otherwise keep letters (up to 6)
+    letters = re.findall(r"[A-Z]", s)
+    if letters:
+        return "".join(letters)[:6]
+    return ""
+
+
+def build_key(prefix: str, cc: str, zone: str) -> str:
+    return f"{prefix}-{cc}-{zone}"
+
+
+def safe_read_excel(path: str) -> pd.DataFrame:
+    # 只读xlsx；若用户误传xls，这里也尽量兼容（依赖环境可能没有xlrd）
+    return pd.read_excel(path, sheet_name=0)
+
+
+def money(x) -> float:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return 0.0
     try:
-        if pd.isna(x):
-            return default
         return float(x)
     except Exception:
-        return default
-
-# -----------------------------
-# Cargo model
-# -----------------------------
-
-@dataclass
-class CargoLine:
-    qty: int
-    piece_weight_kg: float
-    l_cm: float
-    w_cm: float
-    h_cm: float
-
-    def piece_cbm(self) -> float:
-        return (self.l_cm * self.w_cm * self.h_cm) / 1_000_000.0
-
-    def max_dim_cm(self) -> float:
-        return max(self.l_cm, self.w_cm, self.h_cm)
-
-def cargo_totals(lines: List[CargoLine]) -> Tuple[float, float]:
-    total_w = sum(max(0, ln.qty) * max(0.0, ln.piece_weight_kg) for ln in lines)
-    total_cbm = sum(max(0, ln.qty) * max(0.0, ln.piece_cbm()) for ln in lines)
-    return total_w, total_cbm
-
-def any_piece_over_240(lines: List[CargoLine]) -> bool:
-    return any(ln.max_dim_cm() > 240 for ln in lines)
-
-# -----------------------------
-# Load "matrix" Excel (key + bis-xx columns)
-# -----------------------------
-
-@st.cache_data
-def load_matrix(path: str) -> Tuple[Dict[str, Dict[str, float]], List[str], Optional[str]]:
-    """
-    Returns:
-      lut[key][bis-col] = price
-      cols = sorted bis cols
-      keycol = first column name
-    """
-    df = pd.read_excel(path)
-    df.columns = [str(c).strip() for c in df.columns]
-    if df.shape[1] < 2:
-        return {}, [], None
-    keycol = df.columns[0]
-    cols = weight_cols(df)
-    lut: Dict[str, Dict[str, float]] = {}
-    for _, r in df.iterrows():
-        k = str(r.get(keycol, "")).strip()
-        if not k:
-            continue
-        row_map = {}
-        for c in cols:
-            v = r.get(c)
-            if pd.notna(v):
-                row_map[c] = safe_float(v)
-        if row_map:
-            lut[k] = row_map
-    return lut, cols, keycol
-
-def try_load_matrix(path: str, label: str):
-    if not os.path.exists(path):
-        st.warning(f"⚠️ {label} 价格表未找到：{path}")
-        return {}, [], None
-    try:
-        return load_matrix(path)
-    except Exception as e:
-        st.warning(f"⚠️ {label} 价格表读取失败：{e}")
-        return {}, [], None
-
-DHL_LUT, DHL_COLS, _ = try_load_matrix(PATHS["DHL"], "DHL")
-RABEN_LUT, RABEN_COLS, _ = try_load_matrix(PATHS["RABEN"], "Raben")
-SCH_LUT, SCH_COLS, _ = try_load_matrix(PATHS["SCHENKER"], "Schenker")
-HEL_LUT, HEL_COLS, _ = try_load_matrix(PATHS["HELLMANN"], "Hellmann")
-FX_LUT, FX_COLS, _ = try_load_matrix(PATHS["FEDEX"], "FedEx")
-SELL_LUT, SELL_COLS, _ = try_load_matrix(PATHS["SELL"], "对客报价(Sell)")
-
-# -----------------------------
-# Raben volumetric factor rules (fallback = 200)
-# -----------------------------
-
-@st.cache_data
-def load_raben_factor_rules(path: str) -> Dict[str, float]:
-    """
-    Try to find a sheet with columns like country/factor, or any table.
-    We keep this tolerant: if cannot parse, returns empty -> default 200.
-    """
-    if not os.path.exists(path):
-        return {}
-    try:
-        xls = pd.ExcelFile(path)
-        best: Dict[str, float] = {}
-        for sh in xls.sheet_names:
-            df = xls.parse(sh)
-            df.columns = [str(c).strip().lower() for c in df.columns]
-            # heuristic: find country + factor columns
-            col_country = None
-            col_factor = None
-            for c in df.columns:
-                if "country" in c or "land" in c:
-                    col_country = c
-                if "factor" in c or "kg/cbm" in c or "kg je cbm" in c or "volum" in c:
-                    col_factor = c
-            if col_country and col_factor:
-                for _, r in df.iterrows():
-                    ctry = cc(r.get(col_country, ""))
-                    fac = safe_float(r.get(col_factor, None), default=0.0)
-                    if ctry and fac > 0:
-                        best[ctry] = fac
-        return best
-    except Exception:
-        return {}
-
-RABEN_FACTOR_RULES = load_raben_factor_rules(PATHS["RABEN_RULES"])
-
-def raben_factor(country: str) -> float:
-    return float(RABEN_FACTOR_RULES.get(cc(country), 200.0))
-
-# -----------------------------
-# Hellmann country rules (Maut% + Staatliche Abgaben%)
-# FINAL V5 dict based on your screenshots
-# -----------------------------
-
-HELLMANN_RULES = {
-    "DE": {"maut_pct": 18.2, "state_pct": 0.0, "vol_factor": 150.0},
-    "AT": {"maut_pct": 13.3, "state_pct": 6.6, "vol_factor": 200.0},
-    "BE": {"maut_pct": 9.7,  "state_pct": 2.1, "vol_factor": 200.0},
-    "BG": {"maut_pct": 6.2,  "state_pct": 9.9, "vol_factor": 200.0},
-    "CZ": {"maut_pct": 8.6,  "state_pct": 5.4, "vol_factor": 200.0},
-    "DK": {"maut_pct": 8.6,  "state_pct": 0.1, "vol_factor": 200.0},
-    "EE": {"maut_pct": 7.2,  "state_pct": 0.0, "vol_factor": 200.0},
-    "ES": {"maut_pct": 6.7,  "state_pct": 0.0, "vol_factor": 200.0},
-    "FI": {"maut_pct": 4.8,  "state_pct": 3.1, "vol_factor": 200.0},
-    "FR": {"maut_pct": 7.7,  "state_pct": 0.5, "vol_factor": 200.0},
-    "GR": {"maut_pct": 7.8,  "state_pct": 10.0,"vol_factor": 200.0},
-    "HR": {"maut_pct": 9.1,  "state_pct": 11.6,"vol_factor": 200.0},
-    "HU": {"maut_pct": 11.5, "state_pct": 15.2,"vol_factor": 200.0},
-    "IE": {"maut_pct": 6.1,  "state_pct": 3.6, "vol_factor": 200.0},
-    "IT": {"maut_pct": 10.3, "state_pct": 7.0, "vol_factor": 200.0},
-    "LT": {"maut_pct": 7.6,  "state_pct": 0.0, "vol_factor": 200.0},
-    "LU": {"maut_pct": 10.9, "state_pct": 0.0, "vol_factor": 200.0},
-    "LV": {"maut_pct": 7.0,  "state_pct": 0.0, "vol_factor": 200.0},
-    "NL": {"maut_pct": 8.9,  "state_pct": 0.0, "vol_factor": 200.0},
-    "PL": {"maut_pct": 10.2, "state_pct": 2.6, "vol_factor": 200.0},
-    "PT": {"maut_pct": 7.7,  "state_pct": 0.0, "vol_factor": 200.0},
-    "RO": {"maut_pct": 7.0,  "state_pct": 10.6,"vol_factor": 200.0},
-    "SE": {"maut_pct": 3.6,  "state_pct": 0.7, "vol_factor": 200.0},
-    "SI": {"maut_pct": 12.5, "state_pct": 15.3,"vol_factor": 200.0},
-    "SK": {"maut_pct": 8.5,  "state_pct": 5.9, "vol_factor": 200.0},
-    "XK": {"maut_pct": 3.4,  "state_pct": 4.3, "vol_factor": 200.0},
-}
-
-HELLMANN_DG_30_COUNTRIES = {
-    "AL","AT","BA","BE","BG","CH","CZ","DK","EE","ES","FI","FR","HR","HU","IT","LT","LU","LV","ME","MK","NL","PL","PT","RO","RS","SI","SK","XK"
-}
-HELLMANN_DG_75_COUNTRIES = {"FI","GB","GR","IE","NO","SE"}  # per your note
-
-def hellmann_rule(country: str) -> Dict[str, float]:
-    c = cc(country)
-    base = HELLMANN_RULES.get(c, {"maut_pct": 0.0, "state_pct": 0.0, "vol_factor": 200.0})
-    return base
-
-# -----------------------------
-# Diesel floater helper (Hellmann)
-# based on the table in your screenshot:
-# up to 1.48 -> 0.0
-# 1.50 -> 0.5
-# 1.52 -> 1.0
-# ...
-# 1.62 -> 3.5
-# then each +0.02 => +0.5
-# -----------------------------
-
-def hellmann_diesel_pct_from_price(diesel_price_per_l: float) -> float:
-    p = float(diesel_price_per_l)
-    if p <= 1.48:
         return 0.0
-    # anchor at 1.50 => 0.5
-    if p <= 1.50:
-        return 0.5
-    # base at 1.50
-    extra = max(0.0, p - 1.50)
-    steps = int(extra / 0.02 + 1e-9)  # full 0.02 steps
-    return 0.5 + steps * 0.5
 
-# -----------------------------
-# Schenker Maut table (best-effort parser + manual override)
-# You said: maut depends on "total weight" + "distance km"
-# We'll compute based on chargeable weight (Fra.Gew) by default.
-# If parsing fails, allow manual entry.
-# -----------------------------
 
-@st.cache_data
-def load_schenker_maut_table(path: str) -> Optional[pd.DataFrame]:
-    if not os.path.exists(path):
-        return None
-    try:
-        df = pd.read_excel(path)
-        df.columns = [str(c).strip().lower() for c in df.columns]
-        # If already normalized with columns containing kg/km and amount:
-        # Try find columns
-        cols = df.columns
-        if any("km" in c for c in cols) and any("kg" in c or "gew" in c for c in cols):
-            return df
-        return df
-    except Exception:
-        return None
-
-SCHENKER_MAUT_DF = load_schenker_maut_table(PATHS["SCHENKER_MAUT"])
-
-def schenker_maut_lookup(df: Optional[pd.DataFrame], w_kg: float, km: float) -> Optional[float]:
+# =========================
+# 2) Load tables
+# =========================
+@st.cache_data(show_spinner=False)
+def load_rate_table(path: str) -> Tuple[Optional[pd.DataFrame], str]:
     """
-    Best effort:
-    Expected columns (any variant):
-      kg_von, kg_bis, km_von, km_bis, maut
-    If not found -> None
+    Load a rate sheet with a 'key' column + bis-* columns.
+    Returns (df, msg). If fail -> (None, err_msg)
+    """
+    if not os.path.exists(path):
+        return None, f"文件不存在: {path}"
+    try:
+        df = safe_read_excel(path)
+        kcol = find_key_col(df)
+        if not kcol:
+            return None, f"未找到 key 列: {os.path.basename(path)}"
+        # rename key col to 'key'
+        if kcol != "key":
+            df = df.rename(columns={kcol: "key"})
+        df["key"] = df["key"].astype(str).str.strip()
+        # ensure bis cols exist
+        bcols = bis_cols(df)
+        if not bcols:
+            return None, f"未找到任何 bis-* 价格列: {os.path.basename(path)}"
+        return df, "ok"
+    except Exception as e:
+        return None, f"读取失败: {os.path.basename(path)} | {type(e).__name__}: {e}"
+
+
+@st.cache_data(show_spinner=False)
+def load_raben_rules(path: str) -> Tuple[Dict[str, float], str]:
+    """
+    Raben 体积重系数表：返回 {ISO2: factor}
+    规则表结构不确定，所以做“尽可能”识别：
+    - 找到包含 country/land/iso 的列 + factor/volumetric 的列
+    - 否则返回空 dict
+    """
+    if not os.path.exists(path):
+        return {}, f"文件不存在: {path}"
+    try:
+        df = safe_read_excel(path)
+        cols = {norm_col(c): c for c in df.columns}
+        country_col = None
+        for k in cols:
+            if k in ("country", "land", "iso", "iso2", "länder", "laender"):
+                country_col = cols[k]
+                break
+        factor_col = None
+        for k in cols:
+            if "factor" in k or "volum" in k or "cbm" in k or "立方" in k:
+                factor_col = cols[k]
+                break
+
+        if not country_col or not factor_col:
+            # try heuristic: first col country, second col factor
+            if df.shape[1] >= 2:
+                country_col = df.columns[0]
+                factor_col = df.columns[1]
+            else:
+                return {}, "Raben规则表列结构无法识别(已忽略，将使用默认200)"
+
+        lut: Dict[str, float] = {}
+        for _, r in df.iterrows():
+            cc = str(r.get(country_col, "")).strip().upper()
+            if not cc or cc == "NAN":
+                continue
+            val = r.get(factor_col, None)
+            try:
+                f = float(val)
+            except Exception:
+                continue
+            # 只接受合理范围
+            if 50 <= f <= 1000:
+                lut[cc] = f
+        if not lut:
+            return {}, "Raben规则表未解析出有效factor(将使用默认200)"
+        return lut, "ok"
+    except Exception as e:
+        return {}, f"Raben规则表读取失败(已忽略): {type(e).__name__}: {e}"
+
+
+@st.cache_data(show_spinner=False)
+def load_schenker_maut(path: str) -> Tuple[Optional[pd.DataFrame], str]:
+    """
+    Schenker maut 表格结构不稳定；本版本“可读就读”，否则走手动输入。
+    """
+    if not os.path.exists(path):
+        return None, f"文件不存在: {path}"
+    try:
+        df = safe_read_excel(path)
+        return df, "ok"
+    except Exception as e:
+        return None, f"Schenker Maut表读取失败(将仅手动): {type(e).__name__}: {e}"
+
+
+# =========================
+# 3) Hellmann rules (V5 - 全国家字典)
+# =========================
+HELLMANN_RULES_V5 = {
+    # cc: {"maut_pct": x, "state_pct": y, "vol_factor": 200 or 150 by route}
+    # NOTE: vol_factor在代码里按 DE=150, 其它=200 处理；这里主要放百分比
+    "DE": {"maut_pct": 18.2, "state_pct": 0.0},
+
+    "AT": {"maut_pct": 13.3, "state_pct": 6.6},
+    "BE": {"maut_pct": 9.7, "state_pct": 2.1},
+    "BG": {"maut_pct": 6.2, "state_pct": 9.9},
+    "CZ": {"maut_pct": 8.6, "state_pct": 5.4},
+    "DK": {"maut_pct": 8.6, "state_pct": 0.1},
+    "EE": {"maut_pct": 7.2, "state_pct": 0.0},
+    "ES": {"maut_pct": 6.7, "state_pct": 0.0},
+    "FI": {"maut_pct": 4.8, "state_pct": 3.1},
+    "FR": {"maut_pct": 7.7, "state_pct": 0.5},
+    "GR": {"maut_pct": 7.8, "state_pct": 10.0},
+    "HR": {"maut_pct": 9.1, "state_pct": 11.6},
+    "HU": {"maut_pct": 11.5, "state_pct": 15.2},
+    "IE": {"maut_pct": 6.1, "state_pct": 3.6},
+    "IT": {"maut_pct": 10.3, "state_pct": 7.0},
+    "LT": {"maut_pct": 7.6, "state_pct": 0.0},
+    "LU": {"maut_pct": 10.9, "state_pct": 0.0},
+    "LV": {"maut_pct": 7.0, "state_pct": 0.0},
+    "NL": {"maut_pct": 8.9, "state_pct": 0.0},
+    "PL": {"maut_pct": 10.2, "state_pct": 2.6},
+    "PT": {"maut_pct": 7.7, "state_pct": 0.0},
+    "RO": {"maut_pct": 7.0, "state_pct": 10.6},
+    "SE": {"maut_pct": 3.6, "state_pct": 0.7},
+    "SI": {"maut_pct": 12.5, "state_pct": 15.3},
+    "SK": {"maut_pct": 8.5, "state_pct": 5.9},
+    "XK": {"maut_pct": 3.4, "state_pct": 4.3},
+}
+
+# DG surcharge lists (用户给的条款)
+HELLMANN_DG_30 = set("AL AT BA BE BG CH CZ DK EE ES FL FR HR HU IT LT LU LV ME MK NL PL PT RO RS SI SK XK".split())
+HELLMANN_DG_75 = set("FI GB GR IE NO SE".split())
+
+
+def hellmann_diesel_pct(diesel_price_eur_per_l: float) -> float:
+    """
+    根据Dieselfloater表：
+    <=1.48:0%
+    <=1.50:0.5%
+    <=1.52:1.0%
+    <=1.54:1.5%
+    <=1.56:2.0%
+    <=1.58:2.5%
+    <=1.60:3.0%
+    <=1.62:3.5%
+    之后每+0.02 => +0.5
+    """
+    p = float(diesel_price_eur_per_l)
+    thresholds = [
+        (1.48, 0.0),
+        (1.50, 0.5),
+        (1.52, 1.0),
+        (1.54, 1.5),
+        (1.56, 2.0),
+        (1.58, 2.5),
+        (1.60, 3.0),
+        (1.62, 3.5),
+    ]
+    for t, pct in thresholds:
+        if p <= t + 1e-9:
+            return pct
+    # above 1.62
+    extra = p - 1.62
+    steps = int(np.floor(extra / 0.02 + 1e-9))
+    return 3.5 + steps * 0.5
+
+
+# =========================
+# 4) Chargeable weight
+# =========================
+def calc_totals(lines: pd.DataFrame) -> Tuple[float, float, float]:
+    """
+    Returns: total_pieces, total_actual_kg, total_cbm
+    """
+    total_pieces = float((lines["qty"] if "qty" in lines else 0).sum())
+    total_actual_kg = float((lines["qty"] * lines["weight_kg"]).sum())
+    # cbm = L*W*H / 1e6 in m3 * qty
+    cbm = (lines["l_cm"] * lines["w_cm"] * lines["h_cm"]) / 1_000_000.0
+    total_cbm = float((lines["qty"] * cbm).sum())
+    return total_pieces, total_actual_kg, total_cbm
+
+
+def charge_weight_generic(total_actual_kg: float, total_cbm: float, factor: float) -> float:
+    return float(max(total_actual_kg, total_cbm * factor))
+
+
+def charge_weight_fedex(lines: pd.DataFrame, factor: float = 200.0, min_piece_kg: float = 68.0) -> float:
+    """
+    FedEx: 每件最低计重68kg，且计费重= max(实重,体积重) 再与68取max（逐件）
+    """
+    cbm_piece = (lines["l_cm"] * lines["w_cm"] * lines["h_cm"]) / 1_000_000.0
+    vol_kg_piece = cbm_piece * factor
+    piece_charge = np.maximum(np.maximum(lines["weight_kg"].astype(float), vol_kg_piece.astype(float)), min_piece_kg)
+    return float((piece_charge * lines["qty"].astype(float)).sum())
+
+
+# =========================
+# 5) Price lookup
+# =========================
+def lookup_price(df: pd.DataFrame, key: str, charge_kg: float) -> Tuple[Optional[float], Optional[str], str]:
+    """
+    Returns: (price, bracket_col, note)
     """
     if df is None or df.empty:
-        return None
-
-    cols = list(df.columns)
-
-    def find_col(keys):
-        for k in keys:
-            for c in cols:
-                if k in c:
-                    return c
-        return None
-
-    c_kg_from = find_col(["kg_von","kg from","von_kg","weight_from","gew_von"])
-    c_kg_to   = find_col(["kg_bis","kg to","bis_kg","weight_to","gew_bis"])
-    c_km_from = find_col(["km_von","km from","von_km","dist_from","distance_from"])
-    c_km_to   = find_col(["km_bis","km to","bis_km","dist_to","distance_to"])
-    c_val     = find_col(["maut","toll","betrag","amount","eur"])
-
-    if not all([c_kg_from, c_kg_to, c_km_from, c_km_to, c_val]):
-        return None
-
-    # filter
-    sub = df.copy()
-    sub[c_kg_from] = pd.to_numeric(sub[c_kg_from], errors="coerce")
-    sub[c_kg_to]   = pd.to_numeric(sub[c_kg_to], errors="coerce")
-    sub[c_km_from] = pd.to_numeric(sub[c_km_from], errors="coerce")
-    sub[c_km_to]   = pd.to_numeric(sub[c_km_to], errors="coerce")
-    sub[c_val]     = pd.to_numeric(sub[c_val], errors="coerce")
-
-    sub = sub.dropna(subset=[c_kg_from,c_kg_to,c_km_from,c_km_to,c_val])
-
-    w = float(w_kg)
-    d = float(km)
-
-    hit = sub[
-        (sub[c_kg_from] <= w) & (w <= sub[c_kg_to]) &
-        (sub[c_km_from] <= d) & (d <= sub[c_km_to])
-    ]
-
+        return None, None, "价格表未加载"
+    hit = df[df["key"].astype(str).str.strip() == key]
     if hit.empty:
-        return None
+        return None, None, f"未找到线路 key={key}"
+    row = hit.iloc[0]
+    bcols = bis_cols(df)
+    bname = pick_bracket(bcols, charge_kg)
+    if not bname:
+        max_b = max(x[1] for x in bcols) if bcols else None
+        return None, None, f"计费重{charge_kg:.2f}kg 超出最大档位({max_b})"
+    val = row.get(bname, None)
+    try:
+        price = float(val)
+    except Exception:
+        return None, bname, f"档位{bname}无有效价格"
+    return price, bname, "ok"
 
-    # take first (should be unique)
-    return float(hit.iloc[0][c_val])
 
-# -----------------------------
-# Robust key matching
-# -----------------------------
+# =========================
+# 6) App UI
+# =========================
+st.set_page_config(page_title="Aifuge Freight Engine V6", layout="wide")
+st.title("Aifuge Freight Engine V6 — 成本 + 对客报价(SELL) + 毛利")
 
-def lookup_price(lut: Dict[str, Dict[str, float]], cols: List[str], prefix: str, country: str, postal: str, w_kg: float):
-    """
-    Try multiple key candidates:
-      PREFIX-CC--<postal 5/4/3/2>
-    Return (ok, key_used, bracket, price)
-    """
-    if not lut:
-        return False, "", "", 0.0, "无价格表"
+with st.expander("📦 数据文件状态 (data/ 自动读取)", expanded=False):
+    for k, p in PATHS.items():
+        st.write(f"- **{k}**: `{p}` {'✅' if os.path.exists(p) else '❌'}")
 
-    ctry = cc(country)
-    candidates = zip_prefix_candidates(postal)
-    tried_keys = []
+# Load tables
+DHL_DF, DHL_MSG = load_rate_table(PATHS["DHL"])
+RABEN_DF, RABEN_MSG = load_rate_table(PATHS["RABEN"])
+SCHENKER_DF, SCHENKER_MSG = load_rate_table(PATHS["SCHENKER"])
+HELLMANN_DF, HELLMANN_MSG = load_rate_table(PATHS["HELLMANN"])
+FEDEX_DF, FEDEX_MSG = load_rate_table(PATHS["FEDEX"])
+SELL_DF, SELL_MSG = load_rate_table(PATHS["SELL"])
 
-    for z in candidates:
-        k = make_key(prefix, ctry, z)
-        tried_keys.append(k)
-        if k in lut:
-            bracket = pick_bracket(cols, w_kg)
-            if not bracket:
-                return False, k, "", 0.0, "缺少重量区间列(bis-*)"
-            price = lut[k].get(bracket)
-            if price is None:
-                return False, k, bracket, 0.0, "该重量区间无价格"
-            return True, k, bracket, float(price), ""
+RABEN_FACTORS, RABEN_RULES_MSG = load_raben_rules(PATHS["RABEN_RULES"])
+SCHENKER_MAUT_DF, SCHENKER_MAUT_MSG = load_schenker_maut(PATHS["SCHENKER_MAUT"])
 
-    # Also try exact key as stored if user typed already like "38" etc (done above)
-    return False, "", "", 0.0, f"未找到线路（已尝试 {len(tried_keys)} 个key，如：{tried_keys[:2]} ...）"
+warns = []
+for name, msg in [
+    ("DHL", DHL_MSG),
+    ("Raben", RABEN_MSG),
+    ("Schenker", SCHENKER_MSG),
+    ("Hellmann", HELLMANN_MSG),
+    ("FedEx", FEDEX_MSG),
+    ("SELL(对客)", SELL_MSG),
+]:
+    if msg != "ok":
+        warns.append(f"{name}: {msg}")
+if RABEN_RULES_MSG != "ok":
+    warns.append(f"Raben规则: {RABEN_RULES_MSG}")
+if SCHENKER_MAUT_MSG != "ok":
+    warns.append(f"SchenkerMaut: {SCHENKER_MAUT_MSG}")
 
-# -----------------------------
-# Chargeable weight rules
-# -----------------------------
+if warns:
+    st.warning(" | ".join(warns))
 
-def charge_weight_total(actual_kg: float, cbm: float, vol_factor: float) -> float:
-    return max(float(actual_kg), float(cbm) * float(vol_factor))
+# -------------------------
+# Inputs
+# -------------------------
+c1, c2, c3 = st.columns([1, 1, 2])
+with c1:
+    dest_cc = st.text_input("目的国(ISO2)", value="DE").strip().upper()
+with c2:
+    zone_input = st.text_input("邮编/区域(用于key的ZZ)", value="38112")
+with c3:
+    st.caption("说明：系统会把你输入的邮编/区域转成 ZZ：数字取前2位(保留0)，字母如 DUB 直接用。")
 
-def fedex_charge_weight_piecewise(lines: List[CargoLine], vol_factor: float = 200.0, min_piece_kg: float = 68.0) -> float:
-    total = 0.0
-    for ln in lines:
-        for _ in range(max(0, ln.qty)):
-            piece_actual = max(0.0, ln.piece_weight_kg)
-            piece_vol = max(0.0, ln.piece_cbm()) * vol_factor
-            piece_charge = max(piece_actual, piece_vol, min_piece_kg)
-            total += piece_charge
-    return total
+zone = parse_zone_from_input(zone_input)
+if not zone:
+    st.error("无法解析 ZZ (请填写邮编前2位或区域代码，如 38112 / 08xxx / DUB)")
+    st.stop()
 
-# -----------------------------
-# UI Inputs
-# -----------------------------
+st.markdown("### 货物明细（多件：qty/weight/L/W/H）")
 
-st.subheader("输入")
-
-colA, colB = st.columns([1,2])
-with colA:
-    dest_country = cc(st.text_input("目的国家 (ISO2)", "DE"))
-with colB:
-    dest_postal = st.text_input("收件邮编 (用于key匹配)", "38112")
-
-# cargo editor
-cargo_df = st.data_editor(
-    pd.DataFrame([{"qty": 1, "weight_kg": 20.0, "l_cm": 60.0, "w_cm": 40.0, "h_cm": 40.0}]),
-    num_rows="dynamic",
-    use_container_width=True
+default_lines = pd.DataFrame(
+    [{"qty": 1, "weight_kg": 20.0, "l_cm": 60.0, "w_cm": 40.0, "h_cm": 40.0}]
 )
 
-lines: List[CargoLine] = []
-for _, r in cargo_df.iterrows():
-    lines.append(
-        CargoLine(
-            qty=int(r.get("qty", 0) or 0),
-            piece_weight_kg=float(r.get("weight_kg", 0) or 0),
-            l_cm=float(r.get("l_cm", 0) or 0),
-            w_cm=float(r.get("w_cm", 0) or 0),
-            h_cm=float(r.get("h_cm", 0) or 0),
-        )
-    )
+lines = st.data_editor(
+    default_lines,
+    num_rows="dynamic",
+    use_container_width=True,
+    key="lines_editor",
+)
 
-actual_kg, total_cbm = cargo_totals(lines)
-sell_charge_kg = charge_weight_total(actual_kg, total_cbm, 200.0)  # customer volumetric factor always 200 kg/m³ (your rule)
+# validate numeric
+for col in ["qty", "weight_kg", "l_cm", "w_cm", "h_cm"]:
+    if col not in lines.columns:
+        st.error(f"缺少列: {col}")
+        st.stop()
+lines = lines.fillna(0)
+for col in ["qty", "weight_kg", "l_cm", "w_cm", "h_cm"]:
+    try:
+        lines[col] = lines[col].astype(float)
+    except Exception:
+        st.error(f"列 {col} 需要是数字")
+        st.stop()
+
+total_pieces, total_actual_kg, total_cbm = calc_totals(lines)
 
 st.markdown(
-    f"**合计实重(kg)：** {actual_kg:.2f}  ｜  **合计体积(m³)：** {total_cbm:.4f}  ｜  "
-    f"**对客计费重(kg)：** {sell_charge_kg:.2f}（max(实重, 体积×200)）"
+    f"**合计实重(kg)**: `{total_actual_kg:.2f}`  |  "
+    f"**合计体积(m³)**: `{total_cbm:.4f}`  |  "
+    f"**件数(行内qty合计)**: `{total_pieces:.0f}`"
 )
 
-st.divider()
+# -------------------------
+# Extras / Parameters
+# -------------------------
+st.markdown("### 附加费/参数（可上线：先手动，后续可接API）")
 
-st.subheader("附加费/参数（可上线：先手动，后续再接API）")
+e1, e2, e3 = st.columns(3)
 
-p1, p2, p3 = st.columns(3)
-
-with p1:
+with e1:
     dhl_avis = st.checkbox("DHL Avis（电话预约）+11€", value=False)
-    schenker_avis = st.checkbox("Schenker Avis（电话预约）+20€", value=False)
-    schenker_floating_pct = st.number_input("Schenker Diesel Floating %（手动）", min_value=0.0, max_value=100.0, value=0.0, step=0.1)
 
-with p2:
-    schenker_distance_km = st.number_input("Schenker 运输距离 km（手动）", min_value=0.0, value=0.0, step=1.0)
-    schenker_maut_manual = st.number_input("Schenker Maut €（手动覆盖，0=不用）", min_value=0.0, value=0.0, step=0.01)
-    # if you want choose Fra/Wirk later:
-    schenker_maut_use_charge = st.checkbox("Schenker Maut 使用计费重(Fra.Gew)", value=True)
+with e2:
+    sch_avis = st.checkbox("Schenker Avis（电话预约）+20€", value=False)
+    sch_diesel_pct = st.number_input("Schenker Diesel Floating %（手动）", min_value=0.0, max_value=100.0, value=0.0, step=0.1)
+    sch_maut_pct_manual = st.number_input("Schenker Maut %（手动）", min_value=0.0, max_value=100.0, value=0.0, step=0.1)
 
-with p3:
-    hellmann_b2c = st.checkbox("Hellmann B2C +8.9€", value=False)
-    hellmann_avis = st.checkbox("Hellmann Avis +12.5€", value=False)
-    hellmann_dg = st.checkbox("Hellmann 危险品 DG（叠加B2C/Avis）", value=False)
-    hellmann_diesel_price = st.number_input("Hellmann Diesel €/L（用于Diesel-Floater）", min_value=0.0, value=1.50, step=0.01)
+with e3:
+    # Hellmann extras
+    hell_b2c = st.checkbox("Hellmann B2C +8.9€（可与DG/Avis叠加）", value=False)
+    hell_avis = st.checkbox("Hellmann Avis +12.5€（可与DG/B2C叠加）", value=False)
+    hell_dg = st.checkbox("Hellmann 危险品 DG（可与B2C/Avis叠加）", value=False)
+    diesel_price = st.number_input("Hellmann Diesel €/L（用于Dieselfloater）", min_value=0.0, max_value=10.0, value=1.50, step=0.01)
 
-length_over_240 = any_piece_over_240(lines)
-st.caption("单件最长边 > 240cm 时，Hellmann Längenzuschlag 可叠加（你说的规则）。")
-hellmann_length = st.checkbox("Hellmann Längenzuschlag +30€（单件最长边>240cm）", value=length_over_240)
+# Length surcharge: any piece longest edge >240
+max_edge_cm = float(np.max(np.maximum.reduce([lines["l_cm"], lines["w_cm"], lines["h_cm"]]))) if len(lines) else 0.0
+hell_len_auto = max_edge_cm > 240.0
+hell_len = st.checkbox(f"Hellmann Längenzuschlag +30€（单件最长边>240cm；当前最大边={max_edge_cm:.0f}cm）", value=hell_len_auto)
 
-st.divider()
+# -------------------------
+# Compute chargeable weights
+# -------------------------
+def factor_for(carrier: str, cc: str) -> float:
+    cc = (cc or "").upper()
+    if carrier == "DHL":
+        return 200.0
+    if carrier == "Raben":
+        return float(RABEN_FACTORS.get(cc, 200.0))
+    if carrier == "Schenker":
+        return 150.0 if cc == "DE" else 200.0
+    if carrier == "Hellmann":
+        return 150.0 if cc == "DE" else 200.0
+    if carrier == "FedEx":
+        return 200.0
+    return 200.0
 
-# -----------------------------
-# Calculate per carrier
-# -----------------------------
 
-def calc_dhl() -> dict:
-    vol_factor = 200.0
-    cw = charge_weight_total(actual_kg, total_cbm, vol_factor)
-    ok, k, br, base, note = lookup_price(DHL_LUT, DHL_COLS, "DHL", dest_country, dest_postal, cw)
-    extras = 11.0 if dhl_avis else 0.0
-    total = base + extras if ok else 0.0
-    return {"carrier":"DHL","ok":ok,"key":k,"charge_kg":cw,"bracket":br,"base":base,"extras":extras,"total":total,"note":note}
+# SELL（对客）固定 200 kg/m3
+sell_charge_kg = charge_weight_generic(total_actual_kg, total_cbm, 200.0)
 
-def calc_raben() -> dict:
-    vol_factor = raben_factor(dest_country)  # from rules or default 200
-    cw = charge_weight_total(actual_kg, total_cbm, vol_factor)
-    ok, k, br, base, note = lookup_price(RABEN_LUT, RABEN_COLS, "RABEN", dest_country, dest_postal, cw)
-    # Raben: you said some zones not served -> if key missing that's expected.
-    extras = 0.0
-    total = base + extras if ok else 0.0
-    if ok and vol_factor != 200.0:
-        note = (note + "；" if note else "") + f"Raben体积系数={vol_factor:g}kg/cbm"
-    return {"carrier":"Raben","ok":ok,"key":k,"charge_kg":cw,"bracket":br,"base":base,"extras":extras,"total":total,"note":note}
+# supplier charge kg
+charge_by_carrier = {}
+for c in SUPPLIERS:
+    if c == "FedEx":
+        charge_by_carrier[c] = charge_weight_fedex(lines, factor=200.0, min_piece_kg=68.0)
+    else:
+        charge_by_carrier[c] = charge_weight_generic(total_actual_kg, total_cbm, factor_for(c, dest_cc))
 
-def calc_schenker() -> dict:
-    vol_factor = 150.0 if cc(dest_country) == "DE" else 200.0
-    cw = charge_weight_total(actual_kg, total_cbm, vol_factor)
-    ok, k, br, base, note = lookup_price(SCH_LUT, SCH_COLS, "SCHENKER", dest_country, dest_postal, cw)
+st.markdown(
+    "#### 计费重(kg)\n"
+    + " | ".join([f"**{k}**: `{v:.2f}`" for k, v in charge_by_carrier.items()])
+    + f" | **SELL**: `{sell_charge_kg:.2f}`"
+)
 
-    # Diesel floating as % of freight cost (base)
-    floating = (schenker_floating_pct/100.0) * base if ok else 0.0
+# -------------------------
+# Main compare table
+# -------------------------
+def dg_fee_for_country(cc: str) -> float:
+    cc = (cc or "").upper()
+    if cc == "DE":
+        return 15.0
+    if cc in HELLMANN_DG_75:
+        return 75.0
+    # 默认落到30组
+    return 30.0
 
-    # Maut
-    maut = 0.0
-    if ok:
-        if schenker_maut_manual > 0:
-            maut = schenker_maut_manual
-        else:
-            w_for_maut = cw if schenker_maut_use_charge else actual_kg
-            maut_guess = schenker_maut_lookup(SCHENKER_MAUT_DF, w_for_maut, schenker_distance_km)
-            if maut_guess is not None:
-                maut = maut_guess
-            else:
-                # If we can't parse the maut table, keep 0 but add note
-                note = (note + "；" if note else "") + "Maut表未能自动解析（可手动输入覆盖）"
 
-    avis = 20.0 if schenker_avis else 0.0
-    extras = floating + maut + avis
-    total = base + extras if ok else 0.0
-    return {
-        "carrier":"Schenker",
-        "ok":ok,
-        "key":k,
-        "charge_kg":cw,
-        "bracket":br,
-        "base":base,
-        "extras":extras,
-        "total":total,
-        "note":note + (f"；DieselFloating={schenker_floating_pct:.1f}%" if ok and schenker_floating_pct>0 else "")
-    }
+def hellmann_percent_fees(cc: str, base: float) -> Tuple[float, str]:
+    """
+    Apply Hellmann Maut% + Staatliche% to base.
+    """
+    cc = (cc or "").upper()
+    rule = HELLMANN_RULES_V5.get(cc, None)
+    if not rule:
+        # 没有规则就按0
+        return 0.0, "Hellmann规则缺失：Maut/State按0%"
+    maut = float(rule.get("maut_pct", 0.0))
+    state = float(rule.get("state_pct", 0.0))
+    fee = base * (maut + state) / 100.0
+    return fee, f"Maut {maut:.1f}% + State {state:.1f}%"
 
-def calc_hellmann() -> dict:
-    rule = hellmann_rule(dest_country)
-    vol_factor = float(rule.get("vol_factor", 200.0))
-    cw = charge_weight_total(actual_kg, total_cbm, vol_factor)
 
-    ok, k, br, base, note = lookup_price(HEL_LUT, HEL_COLS, "HELLMANN", dest_country, dest_postal, cw)
+def schenker_percent_fees(base: float) -> float:
+    # Schenker: 本版本按手动输入
+    return base * (sch_diesel_pct + sch_maut_pct_manual) / 100.0
 
-    # Percent surcharges on base:
-    maut_pct = float(rule.get("maut_pct", 0.0))
-    state_pct = float(rule.get("state_pct", 0.0))
 
-    maut = (maut_pct/100.0) * base if ok else 0.0
-    state = (state_pct/100.0) * base if ok else 0.0
+def sell_lookup(cc: str, zone: str, sell_charge_kg: float) -> Tuple[Optional[float], Optional[str], str]:
+    k = build_key("SELL", cc, zone)
+    return lookup_price(SELL_DF, k, sell_charge_kg)
 
-    # Diesel floater
-    diesel_pct = hellmann_diesel_pct_from_price(hellmann_diesel_price)
-    diesel = (diesel_pct/100.0) * base if ok else 0.0
 
-    # Optional fixed surcharges
-    b2c = 8.9 if hellmann_b2c else 0.0
-    avis = 12.5 if hellmann_avis else 0.0
-    length = 30.0 if hellmann_length else 0.0
+def supplier_lookup_and_cost(carrier: str) -> Dict:
+    cc = dest_cc
+    zz = zone
+    prefix = carrier.upper()
+    k = build_key(prefix, cc, zz)
+    charge_kg = charge_by_carrier[carrier]
 
-    # DG varies:
-    dg = 0.0
-    if hellmann_dg:
-        c = cc(dest_country)
-        if c == "DE":
-            dg = 15.0
-        elif c in HELLMANN_DG_75_COUNTRIES:
-            dg = 75.0
-        else:
-            dg = 30.0
+    if carrier == "DHL":
+        base, bracket, note = lookup_price(DHL_DF, k, charge_kg)
+        if base is None:
+            return {"carrier": carrier, "ok": False, "key": k, "charge_kg": charge_kg, "bracket": bracket or "-", "base": 0.0,
+                    "extras": 0.0, "total_cost": 0.0, "note": note}
+        extras = 0.0
+        if dhl_avis:
+            extras += 11.0
+        total = base + extras
+        return {"carrier": carrier, "ok": True, "key": k, "charge_kg": charge_kg, "bracket": bracket, "base": base,
+                "extras": extras, "total_cost": total, "note": "ok"}
 
-    extras = maut + state + diesel + b2c + avis + length + dg
-    total = base + extras if ok else 0.0
+    if carrier == "Raben":
+        base, bracket, note = lookup_price(RABEN_DF, k, charge_kg)
+        if base is None:
+            return {"carrier": carrier, "ok": False, "key": k, "charge_kg": charge_kg, "bracket": bracket or "-", "base": 0.0,
+                    "extras": 0.0, "total_cost": 0.0, "note": note}
+        # 目前未接入额外费用
+        extras = 0.0
+        total = base + extras
+        return {"carrier": carrier, "ok": True, "key": k, "charge_kg": charge_kg, "bracket": bracket, "base": base,
+                "extras": extras, "total_cost": total, "note": f"ok (vol_factor={factor_for('Raben', cc):.0f})"}
 
-    if ok:
-        note2 = []
-        note2.append(f"Maut={maut_pct:g}%")
-        note2.append(f"Staat={state_pct:g}%")
-        note2.append(f"Diesel≈{diesel_pct:g}% (€/L={hellmann_diesel_price:.2f})")
-        note = (note + "；" if note else "") + ", ".join(note2)
+    if carrier == "Schenker":
+        base, bracket, note = lookup_price(SCHENKER_DF, k, charge_kg)
+        if base is None:
+            return {"carrier": carrier, "ok": False, "key": k, "charge_kg": charge_kg, "bracket": bracket or "-", "base": 0.0,
+                    "extras": 0.0, "total_cost": 0.0, "note": note}
+        extras = 0.0
+        if sch_avis:
+            extras += 20.0
+        # percent fees
+        extras += schenker_percent_fees(base)
+        total = base + extras
+        note2 = f"ok (Schenker factor={factor_for('Schenker', cc):.0f}; diesel%+maut%={sch_diesel_pct+sch_maut_pct_manual:.1f}%)"
+        return {"carrier": carrier, "ok": True, "key": k, "charge_kg": charge_kg, "bracket": bracket, "base": base,
+                "extras": extras, "total_cost": total, "note": note2}
 
-    return {"carrier":"Hellmann","ok":ok,"key":k,"charge_kg":cw,"bracket":br,"base":base,"extras":extras,"total":total,"note":note}
+    if carrier == "Hellmann":
+        base, bracket, note = lookup_price(HELLMANN_DF, k, charge_kg)
+        if base is None:
+            return {"carrier": carrier, "ok": False, "key": k, "charge_kg": charge_kg, "bracket": bracket or "-", "base": 0.0,
+                    "extras": 0.0, "total_cost": 0.0, "note": note}
+        extras = 0.0
 
-def calc_fedex() -> dict:
-    # FedEx: piecewise min 68kg each piece + factor 200
-    cw = fedex_charge_weight_piecewise(lines, vol_factor=200.0, min_piece_kg=68.0)
-    ok, k, br, base, note = lookup_price(FX_LUT, FX_COLS, "FEDEX", dest_country, dest_postal, cw)
-    # FedEx price already includes fuel/toll/avis per your rule -> no extras
-    extras = 0.0
-    total = base if ok else 0.0
-    if ok:
-        note = (note + "；" if note else "") + "FedEx含每件≥68kg规则(已计入计费重)"
-    return {"carrier":"FedEx","ok":ok,"key":k,"charge_kg":cw,"bracket":br,"base":base,"extras":extras,"total":total,"note":note}
+        # percent fees: maut+state
+        pct_fee, pct_note = hellmann_percent_fees(cc, base)
+        extras += pct_fee
 
-def calc_sell() -> dict:
-    # Sell uses volumetric factor 200 and max(total actual, total cbm*200)
-    cw = sell_charge_kg
-    ok, k, br, base, note = lookup_price(SELL_LUT, SELL_COLS, "SELL", dest_country, dest_postal, cw)
-    return {"sell_ok":ok, "sell_key":k, "sell_bracket":br, "sell_price":base, "sell_note":note}
+        # diesel floater percent on freight cost (base)
+        d_pct = hellmann_diesel_pct(diesel_price)
+        extras += base * d_pct / 100.0
 
-# -----------------------------
-# Run calcs
-# -----------------------------
+        # fixed extras (stackable)
+        if hell_b2c:
+            extras += 8.9
+        if hell_avis:
+            extras += 12.5
+        if hell_len:
+            extras += 30.0
+        if hell_dg:
+            extras += dg_fee_for_country(cc)
 
-dhl = calc_dhl()
-raben = calc_raben()
-sch = calc_schenker()
-hel = calc_hellmann()
-fx = calc_fedex()
-sell = calc_sell()
+        total = base + extras
+        note2 = f"ok ({pct_note}; diesel={d_pct:.1f}%; factor={factor_for('Hellmann', cc):.0f})"
+        return {"carrier": carrier, "ok": True, "key": k, "charge_kg": charge_kg, "bracket": bracket, "base": base,
+                "extras": extras, "total_cost": total, "note": note2}
 
-rows = [dhl, raben, sch, hel, fx]
-out = pd.DataFrame([{
-    "carrier": r["carrier"],
-    "ok": r["ok"],
-    "key": r["key"],
-    "charge_kg": round(r["charge_kg"], 2),
-    "bracket": r["bracket"],
-    "base": round(r["base"], 2),
-    "extras": round(r["extras"], 2),
-    "total_cost": round(r["total"], 2),
-    "sell_price": round(sell["sell_price"], 2) if sell["sell_ok"] else None,
-    "profit": (round(sell["sell_price"] - r["total"], 2) if (sell["sell_ok"] and r["ok"]) else None),
-    "note": r["note"]
-} for r in rows])
+    if carrier == "FedEx":
+        base, bracket, note = lookup_price(FEDEX_DF, k, charge_kg)
+        if base is None:
+            return {"carrier": carrier, "ok": False, "key": k, "charge_kg": charge_kg, "bracket": bracket or "-", "base": 0.0,
+                    "extras": 0.0, "total_cost": 0.0, "note": note}
+        # FedEx：你说明已包含燃油/路桥/Avis，因此 extras=0
+        extras = 0.0
+        total = base + extras
+        return {"carrier": carrier, "ok": True, "key": k, "charge_kg": charge_kg, "bracket": bracket, "base": base,
+                "extras": extras, "total_cost": total, "note": "ok (inclusive; factor=200; min_piece=68kg)"}
 
-st.subheader("五家同步报价对比（成本/对客/毛利）")
-st.dataframe(out, use_container_width=True)
+    return {"carrier": carrier, "ok": False, "key": k, "charge_kg": charge_kg, "bracket": "-", "base": 0.0,
+            "extras": 0.0, "total_cost": 0.0, "note": "unknown carrier"}
 
-# Show sell debug
-with st.expander("对客报价(Sell) 解析信息", expanded=False):
-    st.write({
-        "sell_ok": sell["sell_ok"],
-        "sell_key": sell["sell_key"],
-        "sell_bracket": sell["sell_bracket"],
-        "sell_price": sell["sell_price"],
-        "sell_note": sell["sell_note"]
-    })
 
-# -----------------------------
+rows = []
+for c in SUPPLIERS:
+    rows.append(supplier_lookup_and_cost(c))
+
+cmp = pd.DataFrame(rows)
+
+# SELL price (对客)
+sell_key = build_key("SELL", dest_cc, zone)
+sell_price, sell_bracket, sell_note = lookup_price(SELL_DF, sell_key, sell_charge_kg)
+
+cmp["sell_key"] = sell_key
+cmp["sell_bracket"] = sell_bracket if sell_bracket else "-"
+cmp["sell_price"] = sell_price if sell_price is not None else np.nan
+cmp["profit"] = (cmp["sell_price"] - cmp["total_cost"]) if sell_price is not None else np.nan
+
+st.markdown("### 五家同步报价对比（成本 / 对客 / 毛利）")
+st.dataframe(
+    cmp[["carrier", "ok", "key", "charge_kg", "bracket", "base", "extras", "total_cost", "sell_key", "sell_bracket", "sell_price", "profit", "note"]],
+    use_container_width=True,
+    hide_index=True,
+)
+
+with st.expander("📌 对客(SELL) 解析信息", expanded=False):
+    st.write(f"- SELL key: **{sell_key}**")
+    st.write(f"- SELL charge_kg: **{sell_charge_kg:.2f}** (max(实重, 体积重*200))")
+    st.write(f"- bracket: **{sell_bracket}**")
+    st.write(f"- sell_price: **{sell_price}**")
+    st.write(f"- note: **{sell_note}**")
+
 # Export
-# -----------------------------
-
-def export_excel() -> bytes:
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        # summary
-        out.to_excel(w, index=False, sheet_name="compare")
-        # inputs
-        pd.DataFrame([{
-            "dest_country": dest_country,
-            "dest_postal": dest_postal,
-            "actual_kg": actual_kg,
-            "cbm": total_cbm,
-            "sell_charge_kg": sell_charge_kg,
-        }]).to_excel(w, index=False, sheet_name="inputs")
-        cargo_df.to_excel(w, index=False, sheet_name="cargo")
+def to_excel_bytes(df_out: pd.DataFrame) -> bytes:
+    import io
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df_out.to_excel(writer, index=False, sheet_name="compare")
     return buf.getvalue()
 
-st.download_button("导出Excel", data=export_excel(), file_name="freight_compare.xlsx")
+st.download_button(
+    "导出Excel（compare）",
+    data=to_excel_bytes(cmp),
+    file_name="aifuge_freight_compare_v6.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
